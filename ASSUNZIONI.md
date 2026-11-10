@@ -1,0 +1,47 @@
+# Assunzioni di Progetto (ASSUNZIONI.md)
+
+Questo file raccoglie tutte le decisioni architetturali, tecniche e funzionali adottate dove le specifiche lasciavano spazio a scelte implementative.
+
+1. **Verifica Endpoint Reale, CORS e Proxy (`server/proxy.mjs`)**:
+   - È stata effettuata una richiesta reale all'endpoint `https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-sensor-values-no-time?variabile=254,0,0/1,-,-,-/B13215&time=<epoch_ora>`.
+   - L'endpoint restituisce un array JSON di ~265 elementi: il primo è `{"time":"<epoch_ms>"}` e i successivi sono oggetti stazione conformi alla struttura attesa (`idstazione`, `ordinamento`, `nomestaz`, `lon`, `lat`, `soglia1`, `soglia2`, `soglia3`, `value`, `precedente`).
+   - **Analisi CORS**: Il server risponde con `Access-Control-Allow-Origin` riflettendo l'`Origin`, ma è posto dietro una cache Varnish (`X-Varnish`, `X-Cache-TTL: 120.000`) con `Vary: Accept-Encoding` e **senza** `Vary: Origin`. Pertanto, quando Varnish mette in cache una risposta generata con un'origine diversa (o senza header `Origin`), il browser può subire blocchi CORS intermittenti.
+   - **Soluzione adottata**: È stato realizzato `server/proxy.mjs` (Node.js, zero dipendenze, avviabile con `npm start`) che serve `/dist` e inoltra `/api/sensori` all'endpoint configurabile (`ARPAE_API_URL`) con `Access-Control-Allow-Origin: *`. Nel modulo `fonte-dati`, l'URL base è configurabile: tenta l'URL configurato e, in caso di errore di rete/CORS quando eseguito via HTTP con proxy locale, supporta il fallback automatico o l'uso diretto dell'endpoint ufficiale (così anche `/dist/index.html` aperto direttamente mostra i dati reali).
+2. **Calcolo dinamico del parametro `time` (Fonte Dati)**:
+   - L'istante corrente viene arrotondato per difetto all'ora intera tramite `Math.floor(now / 3600000) * 3600000` (1 ora = `3_600_000` ms).
+   - Se la risposta contiene esclusivamente stazioni con `value: null`, il client riprova sottraendo 1 ora (`3_600_000` ms) a ogni tentativo, fino a un massimo di 3 tentativi aggiuntivi oltre al primo (4 richieste totali massime: `T`, `T - 1h`, `T - 2h`, `T - 3h`).
+2. **Soglie = 0 e soglie negative**:
+   - Una soglia con valore `0` o `null` o `undefined` è considerata "non definita" e viene ignorata nel calcolo del livello di allerta.
+   - Una soglia negativa (es. `-0.3`) è valida e viene confrontata regolarmente con `value >= soglia`.
+3. **Generazione dello slug per i corsi d'acqua (`river:<slug>`)**:
+   - Lo slug viene generato convertendo il nome in minuscolo, normalizzando eventuali caratteri accentati (NFD), sostituendo spazi e caratteri non alfanumerici con `-` (trattino singolo) e rimuovendo trattini iniziali/finali (es. `"Navile-Savena abbandonato"` -> `"river:navile-savena-abbandonato"`, `"Po"` -> `"river:po"`).
+4. **Calcolo del Trend e Previsioni**:
+   - Formula del trend: `Trend in cm/h = (value_ora - value_un_ora_fa) * 100 / ore`, dove `ore = (time_ora - time_precedente) / 3600000`.
+   - Per il valore precedente vengono richiesti sia `time - 15 minuti` (`900_000` ms, `ore = 0.25`) sia `time - 1 ora` (`3_600_000` ms, `ore = 1.0`), mantenendo entrambi in una cache in memoria (`cacheRisposte`).
+   - Se `value_ora === null` oppure `value_precedente === null` (o `ore <= 0`), il trend e le previsioni sono `null` e nella UI vengono mostrati come `"—"`.
+   - Le previsioni a `+1h` e `+2h` sono estrapolazioni lineari del trend calcolate in metri come `value_ora + (trend_cm_h / 100) * 1` e `value_ora + (trend_cm_h / 100) * 2`, sempre etichettate `"stima"` (es. `"1.32 m (stima)"`).
+5. **Cascade Delete dei gruppi personalizzati**:
+   - Quando l'utente elimina un gruppo personalizzato `G`, il gruppo `G` viene rimosso dalla lista dei gruppi personalizzati e dal set dei gruppi monitorati; inoltre tutte le stazioni appartenenti a `G` vengono rimosse dal set delle stazioni aggiunte singolarmente (`stazioniSingole`). Se una stazione di `G` appartiene anche a un altro gruppo ancora monitorato (sia esso `river:*` o un altro `custom:*`), essa continua a essere monitorata tramite quell'altro gruppo.
+6. **Soglie personalizzate**:
+   - L'override delle soglie 1/2/3 configurato nella scheda ARPAE viene salvato in `localStorage` per `idstazione`. Se l'utente inserisce `0` o lascia vuoto un campo soglia, quella specifica soglia è considerata non definita (`null`); il pulsante `"Ripristina soglie ufficiali"` rimuove l'override ripristinando i valori dell'API ARPAE.
+7. **Notifiche Browser, Suono, Persistenza OS e Cookie**:
+   - Le notifiche usano la `Notification API` nativa del browser quando attiva e autorizzata (`permission === 'granted'`). Il primo caricamento delle stazioni monitorate stabilisce il livello di baseline senza generare notifiche spurie; successivamente viene inviata **una sola notifica** per ciascun incremento di livello numerico (`livelloAttuale > livelloPrecedente`, es. `0 -> 1`, `1 -> 2`, `2 -> 3`).
+   - **Suono notifica**: A ogni notifica inviata viene riprodotto un segnale sonoro distintivo tramite Web Audio API (`AudioContext`) con due toni sinusoidali a 880 Hz, senza dipendere da file audio esterni.
+   - **Persistenza nel Centro Notifiche del Sistema Operativo**: Alle notifiche è impostato il flag `requireInteraction: true`, garantendo che rimangano memorizzate nel centro notifiche dell'OS finché l'utente non interagisce.
+   - **Persistenza sessione via Cookie**: Lo stato di attivazione delle notifiche viene salvato nel cookie `notifiche_attive` (`1` o `0`) con scadenza a 365 giorni, ricordando la scelta dell'utente alle sessioni successive.
+   - **Icona pulsante notifiche**: Lo stato del pulsante riflette istantaneamente lo stato effettivo (`🔔 Notifiche attive` quando attiva, `🔕 Attiva notifiche` quando disattivata o in attesa).
+8. **Compatibilità apertura diretta di `/dist/index.html`**:
+   - In `vite.config.ts` è stato configurato `base: './'` e un plugin post-build che rimuove `type="module" crossorigin` dal bundle singolo generato, e in `stato-utente` / `app` è previsto un fallback sicuro in memoria qualora il browser limiti `localStorage` o `history.replaceState` su protocollo `file://`. In questo modo `/dist/index.html` funziona sia se aperto direttamente da disco sia se servito via HTTP (`npm run preview` o `npm start`).
+9. **Avviso livello acqua personalizzato (in metri) senza alterare le soglie ARPAE e Ricerca Gruppi ARPAE**:
+   - Oltre all'override opzionale delle soglie `1/2/3`, su ogni stazione (sia in **Monitoraggio** che in **ARPAE**) è presente il pulsante `"🔔 Imposta avviso notifica (m)"` che permette di definire una quota in metri raggiunta la quale l'app invia una notifica browser e mostra il badge di quota raggiunta, lasciando intatte le soglie ufficiali ARPAE (`soglia1`, `soglia2`, `soglia3`).
+   - Nella pagina **ARPAE** è stata aggiunta una barra di ricerca dedicata anche per la sezione `"Gruppi per corso d'acqua"`.
+   - Il pulsante `"↻ Aggiorna"` nella pagina **Monitoraggio** invalida la cache in memoria e forza una nuova richiesta immediata all'endpoint ARPAE mostrando sia l'ora di riferimento ARPAE (`Ultimo aggiornamento HH:MM`) sia l'orario esatto dell'ultima verifica (`Verificato alle HH:MM:SS`).
+10. **Aggiornamento e Polling Automatico al Minuto (60 secondi), Granularità a 15 Minuti e Cache Storica**:
+   - L'intervallo di auto-refresh dell'applicazione è impostato a **1 minuto** (`60_000` ms).
+   - A ogni intervallo di 1 minuto, l'applicazione interroga l'endpoint ARPAE con `bypassaCache: true` sugli slot al quarto d'ora (`QUINDICI_MINUTI_MS = 900_000` ms: `:00`, `:15`, `:30`, `:45`), individuando la rilevazione consolidata più recente dotata di letture fresche (`precedente === 'N'`) e integrando per le stazioni a cadenza oraria/semioraria l'ultimo valore valido misurato, così da restituire sempre in tempo reale il valore di tutte le stazioni attive.
+   - **Convenzione Timestamp ARPAE**: L'endpoint ARPAE `/api/allerta/get-sensor-values-no-time` interpreta il parametro `time` come limite superiore della finestra di 1 ora (`T + 1h` restituisce la rilevazione all'istante `T`).
+   - Le rilevazioni storiche (`time - 15 minuti` e `time - 1 ora`) sono mantenute nella cache in memoria (`cacheRisposte`) durante i cicli di verifica al minuto, evitando richieste di rete ridondanti per gli istanti passati.
+   - In `vite.config.ts` sono stati configurati i proxy per `/api/sensori` sia in modalità `server` (`npm run dev`) che `preview` (`npm run preview`), rendendo l'inoltro trasparente e libero da problemi CORS in qualsiasi modalità di sviluppo ed esecuzione.
+11. **Pulsante "Grafico" per ogni stazione**:
+   - In ogni scheda stazione (sia in **Monitoraggio** in vista estesa e compatta, sia nel catalogo **ARPAE** nell'elenco completo e nei gruppi per corso d'acqua) è presente il pulsante `"📈 Grafico"` che apre in una nuova finestra (`target="_blank" rel="noopener noreferrer"`) il grafico ufficiale ARPAE generato da `costruisciUrlGraficoStazione(idstazione)`:
+     `https://allertameteo.regione.emilia-romagna.it/web/guest/grafico-sensori?p_p_id=AllertaGraficoPortlet&p_p_lifecycle=0&_AllertaGraficoPortlet_mvcRenderCommandName=%2Fallerta%2Fanimazione%2Fgrafico&r=<idstazione>/254,0,0/1,-,-,-/B13215/<YYYY-MM-DD_inizio>/<YYYY-MM-DD_fine>&stazione=<idstazione>&variabile=254,0,0/1,-,-,-/B13215`.

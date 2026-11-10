@@ -1,0 +1,25 @@
+{
+  "name": "monitoraggio-idraulico-er",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Web app mobile-first per il monitoraggio idraulico dell'Emilia-Romagna (ARPAE)",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "start": "node server/proxy.mjs",
+    "test": "vitest run",
+    "test:modulo": "vitest run"
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.5"
+  }
+}
+
