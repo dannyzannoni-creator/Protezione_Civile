@@ -27,6 +27,9 @@ const PORT = Number(process.env.PORT ?? 3000);
 const TARGET_BASE_URL =
   process.env.ARPAE_API_URL ??
   'https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-sensor-values-no-time';
+const TARGET_SERIES_URL =
+  process.env.ARPAE_SERIES_API_URL ??
+  'https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-time-series/';
 const DEFAULT_VARIABILE = '254,0,0/1,-,-,-/B13215';
 const DIST_DIR = path.resolve(__dirname, '../dist');
 
@@ -87,6 +90,50 @@ function proxySensori(req, res, requestUrl) {
   });
 }
 
+function proxySerieStazione(req, res, requestUrl) {
+  const stazione = requestUrl.searchParams.get('stazione') ?? '';
+  const variabile = requestUrl.searchParams.get('variabile') ?? DEFAULT_VARIABILE;
+
+  const upstreamUrl = new URL(TARGET_SERIES_URL);
+  upstreamUrl.searchParams.set('stazione', stazione);
+  upstreamUrl.searchParams.set('variabile', variabile);
+
+  const client = upstreamUrl.protocol === 'https:' ? https : http;
+
+  const proxyReq = client.get(
+    upstreamUrl,
+    {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'MonitoraggioIdraulicoER-Proxy/1.0',
+      },
+    },
+    (proxyRes) => {
+      res.writeHead(proxyRes.statusCode ?? 502, {
+        'Content-Type': proxyRes.headers['content-type'] ?? 'application/json; charset=utf-8',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Accept',
+        'Cache-Control': 'no-cache',
+      });
+      proxyRes.pipe(res);
+    }
+  );
+
+  proxyReq.on('error', (err) => {
+    res.writeHead(502, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(
+      JSON.stringify({
+        error: 'Errore di connessione verso API serie storica ARPAE',
+        details: err.message,
+      })
+    );
+  });
+}
+
 function serveStaticFile(req, res, pathname) {
   const safePath = pathname === '/' ? '/index.html' : pathname;
   const resolvedPath = path.resolve(DIST_DIR, '.' + safePath);
@@ -128,6 +175,10 @@ export function createServer() {
     const requestUrl = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     if (requestUrl.pathname === '/api/sensori') {
       proxySensori(req, res, requestUrl);
+      return;
+    }
+    if (requestUrl.pathname === '/api/serie-stazione') {
+      proxySerieStazione(req, res, requestUrl);
       return;
     }
 

@@ -11,6 +11,11 @@ export const URL_API_ARPAE_DEFAULT =
 
 export const URL_PROXY_LOCALE = '/api/sensori';
 
+export const URL_API_SERIE_GRAFICO_DEFAULT =
+  'https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-time-series/';
+
+export const URL_PROXY_SERIE_LOCALE = '/api/serie-stazione';
+
 export const VARIABILE_IDROMETRICA = '254,0,0/1,-,-,-/B13215';
 
 export const QUINDICI_MINUTI_MS = 15 * 60 * 1000;
@@ -22,10 +27,16 @@ export const MAX_TENTATIVI_NULL_DEFAULT = 3;
 export type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
 
 export interface ConfigurazioneFonteDati {
-  /** URL base dell'endpoint (default: URL_API_ARPAE_DEFAULT) */
+  /** URL base dell'endpoint anagrafica/sensori (default: URL_API_ARPAE_DEFAULT) */
   baseUrl?: string;
-  /** URL secondario di fallback (es. /api/sensori quando servito dal proxy locale) */
+  /** URL secondario di fallback per l'anagrafica (es. /api/sensori) */
   fallbackBaseUrl?: string | null;
+  /** URL base dell'endpoint serie storica del grafico (default: URL_API_SERIE_GRAFICO_DEFAULT) */
+  serieGraficoBaseUrl?: string;
+  /** URL secondario di fallback per la serie storica del grafico (es. /api/serie-stazione) */
+  fallbackSerieGraficoBaseUrl?: string | null;
+  /** Se true, aggiorna il valore di ogni stazione con l'ultimo dato del grafico (get-time-series) */
+  usaSerieGrafico?: boolean;
   /** Parametro costante variabile idrometrica */
   variabile?: string;
   /** Funzione fetch iniettabile per test (default: globalThis.fetch) */
@@ -81,6 +92,144 @@ export function costruisciUrlGraficoStazione(
   const dataFine = formattaDataIsoLocale(nowMs);
   const dataInizio = formattaDataIsoLocale(nowMs - 2 * 24 * 60 * 60 * 1000);
   return `https://allertameteo.regione.emilia-romagna.it/web/guest/grafico-sensori?p_p_id=AllertaGraficoPortlet&p_p_lifecycle=0&_AllertaGraficoPortlet_mvcRenderCommandName=%2Fallerta%2Fanimazione%2Fgrafico&r=${id}/254,0,0/1,-,-,-/B13215/${dataInizio}/${dataFine}&stazione=${id}&variabile=254,0,0/1,-,-,-/B13215`;
+}
+
+/**
+ * Costruisce l'URL dell'API JSON che alimenta il grafico ARPAE (get-time-series) per una singola stazione.
+ */
+export function costruisciUrlSerieGrafico(
+  baseUrlSerie: string,
+  idstazione: string,
+  variabile: string = VARIABILE_IDROMETRICA
+): string {
+  const separatore = baseUrlSerie.includes('?') ? '&' : '?';
+  const paramStazione = encodeURIComponent(idstazione.trim());
+  const paramVariabile = encodeURIComponent(variabile);
+  return `${baseUrlSerie}${separatore}stazione=${paramStazione}&variabile=${paramVariabile}`;
+}
+
+export interface PuntoSerieGrafico {
+  t: number;
+  v: number | null;
+}
+
+export interface SintesiSerieGrafico {
+  ultimoValore: number | null;
+  ultimoTime: number | null;
+  valore15MinPrima: number | null;
+  valoreUnOraPrima: number | null;
+}
+
+/**
+ * Estrae l'ultimo valore valido del grafico ARPAE (replicando la logica di grafico.js)
+ * e i valori precedenti a -15 minuti e -1 ora dalla serie storica [{ t, v }].
+ */
+export function estraiDatiDaSerieGrafico(raw: unknown): SintesiSerieGrafico | null {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return null;
+  }
+
+  const punti: PuntoSerieGrafico[] = [];
+  for (const item of raw) {
+    if (!isRecord(item) || !('t' in item) || !('v' in item)) {
+      continue;
+    }
+    const t = normalizzaNumero(item.t, NaN);
+    if (!Number.isFinite(t)) continue;
+    const v = normalizzaValoreIdrometrico(item.v);
+    punti.push({ t, v });
+  }
+
+  if (punti.length === 0) {
+    return null;
+  }
+
+  punti.sort((a, b) => a.t - b.t);
+
+  // Stessa regola di grafico.js ARPAE: scarta eventuali null finali entro le ultime 2 ore
+  const tFinale = punti[punti.length - 1].t;
+  while (
+    punti.length > 0 &&
+    punti[punti.length - 1].v === null &&
+    punti[punti.length - 1].t > tFinale - 2 * UN_ORA_MS
+  ) {
+    punti.pop();
+  }
+
+  const ultimo = punti[punti.length - 1];
+  if (!ultimo || ultimo.v === null) {
+    return {
+      ultimoValore: null,
+      ultimoTime: ultimo?.t ?? null,
+      valore15MinPrima: null,
+      valoreUnOraPrima: null,
+    };
+  }
+
+  const ultimoValore = ultimo.v;
+  const ultimoTime = ultimo.t;
+
+  // Ricerca del punto valido più vicino a -15 minuti (tra -5 min e -45 min)
+  const target15m = ultimoTime - QUINDICI_MINUTI_MS;
+  let miglior15m: PuntoSerieGrafico | null = null;
+  let minDiff15m = Infinity;
+
+  // Ricerca del punto valido più vicino a -1 ora (tra -30 min e -2 ore)
+  const target1h = ultimoTime - UN_ORA_MS;
+  let miglior1h: PuntoSerieGrafico | null = null;
+  let minDiff1h = Infinity;
+
+  for (let i = punti.length - 2; i >= 0; i--) {
+    const p = punti[i];
+    if (p.v === null) continue;
+    const dt = ultimoTime - p.t;
+    if (dt <= 0) continue;
+
+    if (dt >= 5 * 60 * 1000 && dt <= 45 * 60 * 1000) {
+      const diff = Math.abs(p.t - target15m);
+      if (diff < minDiff15m) {
+        minDiff15m = diff;
+        miglior15m = p;
+      }
+    }
+
+    if (dt >= 30 * 60 * 1000 && dt <= 2 * UN_ORA_MS) {
+      const diff = Math.abs(p.t - target1h);
+      if (diff < minDiff1h) {
+        minDiff1h = diff;
+        miglior1h = p;
+      }
+    }
+
+    if (dt > 2 * UN_ORA_MS) {
+      break;
+    }
+  }
+
+  let valore15MinPrima: number | null = null;
+  if (miglior15m && miglior15m.v !== null) {
+    const oreEffettive = (ultimoTime - miglior15m.t) / UN_ORA_MS;
+    if (oreEffettive > 0) {
+      const deltaOrario = (ultimoValore - miglior15m.v) / oreEffettive;
+      valore15MinPrima = Number((ultimoValore - deltaOrario * 0.25).toFixed(4));
+    }
+  }
+
+  let valoreUnOraPrima: number | null = null;
+  if (miglior1h && miglior1h.v !== null) {
+    const oreEffettive = (ultimoTime - miglior1h.t) / UN_ORA_MS;
+    if (oreEffettive > 0) {
+      const deltaOrario = (ultimoValore - miglior1h.v) / oreEffettive;
+      valoreUnOraPrima = Number((ultimoValore - deltaOrario * 1).toFixed(4));
+    }
+  }
+
+  return {
+    ultimoValore,
+    ultimoTime,
+    valore15MinPrima,
+    valoreUnOraPrima,
+  };
 }
 
 function isRecord(val: unknown): val is Record<string, unknown> {
@@ -192,6 +341,11 @@ export function creaServizioFonteDati(
   const baseUrl = config.baseUrl ?? URL_API_ARPAE_DEFAULT;
   const fallbackBaseUrl =
     config.fallbackBaseUrl !== undefined ? config.fallbackBaseUrl : URL_PROXY_LOCALE;
+  const serieGraficoBaseUrl = config.serieGraficoBaseUrl ?? URL_API_SERIE_GRAFICO_DEFAULT;
+  const fallbackSerieGraficoBaseUrl =
+    config.fallbackSerieGraficoBaseUrl !== undefined
+      ? config.fallbackSerieGraficoBaseUrl
+      : URL_PROXY_SERIE_LOCALE;
   const variabile = config.variabile ?? VARIABILE_IDROMETRICA;
   const fetchFn: FetchFn = config.fetchFn ?? ((input, init) => globalThis.fetch(input, init));
   const nowFn = config.nowFn ?? (() => Date.now());
@@ -304,6 +458,159 @@ export function creaServizioFonteDati(
     }
   }
 
+  async function scaricaSintesiSerieStazione(
+    idstazione: string
+  ): Promise<SintesiSerieGrafico | null> {
+    const headersRichiesta = {
+      Accept: 'application/json',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+    };
+    const urlPrimario = costruisciUrlSerieGrafico(serieGraficoBaseUrl, idstazione, variabile);
+    let response: Response;
+
+    try {
+      response = await fetchFn(urlPrimario, {
+        headers: headersRichiesta,
+        cache: 'no-cache',
+      });
+      const ct = response.headers?.get?.('content-type') ?? '';
+      if (!response.ok || (ct && !ct.includes('json') && !ct.includes('text/plain'))) {
+        throw new Error(`Risposta serie non valida (${response.status})`);
+      }
+    } catch {
+      if (fallbackSerieGraficoBaseUrl && fallbackSerieGraficoBaseUrl !== serieGraficoBaseUrl) {
+        try {
+          const urlFallback = costruisciUrlSerieGrafico(
+            fallbackSerieGraficoBaseUrl,
+            idstazione,
+            variabile
+          );
+          response = await fetchFn(urlFallback, {
+            headers: headersRichiesta,
+            cache: 'no-cache',
+          });
+          if (!response.ok) return null;
+        } catch {
+          return null;
+        }
+      } else {
+        return null;
+      }
+    }
+
+    try {
+      const rawJson: unknown = await response.json();
+      return estraiDatiDaSerieGrafico(rawJson);
+    } catch {
+      return null;
+    }
+  }
+
+  async function arricchisciDatiConSerieGrafico(
+    correnteBase: RispostaSensori,
+    prec15Base: RispostaSensori | null,
+    prec1hBase: RispostaSensori | null
+  ): Promise<{
+    corrente: RispostaSensori;
+    precedente15Min: RispostaSensori | null;
+    precedenteUnOra: RispostaSensori | null;
+  }> {
+    const stazioni = correnteBase.stazioni;
+    if (stazioni.length === 0) {
+      return {
+        corrente: correnteBase,
+        precedente15Min: prec15Base,
+        precedenteUnOra: prec1hBase,
+      };
+    }
+
+    const mappaSintesi = new Map<string, SintesiSerieGrafico>();
+    let indice = 0;
+    const concorrenza = Math.min(25, stazioni.length);
+
+    async function worker(): Promise<void> {
+      while (indice < stazioni.length) {
+        const staz = stazioni[indice++];
+        const sintesi = await scaricaSintesiSerieStazione(staz.idstazione);
+        if (sintesi) {
+          mappaSintesi.set(staz.idstazione, sintesi);
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: concorrenza }, () => worker()));
+
+    if (mappaSintesi.size === 0) {
+      return {
+        corrente: correnteBase,
+        precedente15Min: prec15Base,
+        precedenteUnOra: prec1hBase,
+      };
+    }
+
+    let maxTimeGrafico = correnteBase.time;
+    const stazioniCorrentiAggiornate: Stazione[] = [];
+    const mappaPrec15 = new Map<string, number | null>();
+    for (const s of prec15Base?.stazioni ?? []) {
+      mappaPrec15.set(s.idstazione, s.value);
+    }
+    const mappaPrec1h = new Map<string, number | null>();
+    for (const s of prec1hBase?.stazioni ?? []) {
+      mappaPrec1h.set(s.idstazione, s.value);
+    }
+
+    for (const s of stazioni) {
+      const sintesi = mappaSintesi.get(s.idstazione);
+      if (sintesi) {
+        if (sintesi.ultimoTime && sintesi.ultimoTime > maxTimeGrafico) {
+          maxTimeGrafico = sintesi.ultimoTime;
+        }
+        stazioniCorrentiAggiornate.push({
+          ...s,
+          value: sintesi.ultimoValore,
+          precedente: sintesi.ultimoValore !== null ? 'N' : 'S',
+        });
+        mappaPrec15.set(s.idstazione, sintesi.valore15MinPrima);
+        mappaPrec1h.set(s.idstazione, sintesi.valoreUnOraPrima);
+      } else {
+        stazioniCorrentiAggiornate.push(s);
+      }
+    }
+
+    const correnteAggiornata: RispostaSensori = {
+      ...correnteBase,
+      time: maxTimeGrafico,
+      stazioni: stazioniCorrentiAggiornate,
+    };
+
+    const precedente15MinAggiornato: RispostaSensori = {
+      time: maxTimeGrafico - QUINDICI_MINUTI_MS,
+      timeRichiesto: maxTimeGrafico - QUINDICI_MINUTI_MS,
+      tentativi: 1,
+      stazioni: stazioniCorrentiAggiornate.map((s) => ({
+        ...s,
+        value: mappaPrec15.get(s.idstazione) ?? null,
+      })),
+    };
+
+    const precedenteUnOraAggiornato: RispostaSensori = {
+      time: maxTimeGrafico - UN_ORA_MS,
+      timeRichiesto: maxTimeGrafico - UN_ORA_MS,
+      tentativi: 1,
+      stazioni: stazioniCorrentiAggiornate.map((s) => ({
+        ...s,
+        value: mappaPrec1h.get(s.idstazione) ?? null,
+      })),
+    };
+
+    return {
+      corrente: correnteAggiornata,
+      precedente15Min: precedente15MinAggiornato,
+      precedenteUnOra: precedenteUnOraAggiornato,
+    };
+  }
+
   async function scaricaConStorico(
     nowMs?: number,
     bypassaCache?: boolean
@@ -365,18 +672,30 @@ export function creaServizioFonteDati(
     const timePrecedente15m = corrente.time - QUINDICI_MINUTI_MS;
     const timePrecedente1h = corrente.time - UN_ORA_MS;
 
-    const precedente15Min = await recuperaStoricoInCacheORete(
+    let precedente15Min = await recuperaStoricoInCacheORete(
       timePrecedente15m,
       usaOffsetArpae
     );
-    const precedenteUnOra = await recuperaStoricoInCacheORete(
+    let precedenteUnOra = await recuperaStoricoInCacheORete(
       timePrecedente1h,
       usaOffsetArpae
     );
 
-    // Se in tempo reale alcune stazioni (che trasmettono solo a :00 o :30) hanno value null nello slot :15/:45,
-    // riportiamo il loro ultimo valore misurato valido da time - 15m o time - 1h per garantire continuità su tutte le stazioni
-    if (usaOffsetArpae && (precedente15Min || precedenteUnOra)) {
+    // Se abilitato (default a runtime quando nowMs === undefined, o se forzato da config.usaSerieGrafico),
+    // preleva per ogni stazione l'ultimo valore direttamente dalla serie del grafico ARPAE (get-time-series)
+    const abilitaSerieGrafico =
+      config.usaSerieGrafico !== undefined ? config.usaSerieGrafico : usaOffsetArpae;
+
+    if (abilitaSerieGrafico) {
+      const arricchiti = await arricchisciDatiConSerieGrafico(
+        corrente,
+        precedente15Min,
+        precedenteUnOra
+      );
+      corrente = arricchiti.corrente;
+      precedente15Min = arricchiti.precedente15Min;
+      precedenteUnOra = arricchiti.precedenteUnOra;
+    } else if (usaOffsetArpae && (precedente15Min || precedenteUnOra)) {
       const mappa15 = new Map<string, Stazione>();
       for (const s of precedente15Min?.stazioni ?? []) {
         mappa15.set(s.idstazione, s);

@@ -5,6 +5,8 @@ import {
   calcolaTimeRiferimento15Min,
   costruisciUrlSensori,
   costruisciUrlGraficoStazione,
+  costruisciUrlSerieGrafico,
+  estraiDatiDaSerieGrafico,
   parsaRispostaSensori,
   tuttiValoriNull,
   creaServizioFonteDati,
@@ -194,6 +196,62 @@ describe('Modulo fonte-dati', () => {
     expect(terzaChiamata.corrente.time).toBe(oraBase);
     expect(terzaChiamata.precedente?.time).toBe(meno15Minuti);
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('estrae l’ultimo valore valido e i valori precedenti dalla serie storica del grafico ARPAE (get-time-series)', async () => {
+    const tUltimo = 1794409200000;
+    const serieMock = [
+      { t: tUltimo - UN_ORA_MS, v: 1.1 },
+      { t: tUltimo - 2 * QUINDICI_MINUTI_MS, v: 1.15 },
+      { t: tUltimo - QUINDICI_MINUTI_MS, v: 1.2 },
+      { t: tUltimo, v: 1.25 },
+      { t: tUltimo + QUINDICI_MINUTI_MS, v: null }, // null finale entro 2h (scartato come in grafico.js)
+    ];
+
+    const urlSerie = costruisciUrlSerieGrafico(
+      'https://allertameteo.regione.emilia-romagna.it/o/api/allerta/get-time-series/',
+      '3103'
+    );
+    expect(urlSerie).toContain('stazione=3103&variabile=');
+
+    const sintesi = estraiDatiDaSerieGrafico(serieMock);
+    expect(sintesi).not.toBeNull();
+    expect(sintesi?.ultimoValore).toBe(1.25);
+    expect(sintesi?.ultimoTime).toBe(tUltimo);
+    expect(sintesi?.valore15MinPrima).toBeCloseTo(1.2, 4);
+    expect(sintesi?.valoreUnOraPrima).toBeCloseTo(1.1, 4);
+
+    // Verifica integrazione in scaricaConStorico con usaSerieGrafico = true
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('get-time-series')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => serieMock,
+        } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => campioneReale,
+      } as Response;
+    });
+
+    const servizio = creaServizioFonteDati({
+      baseUrl: 'https://test.arpae.it/sensori',
+      fallbackBaseUrl: null,
+      serieGraficoBaseUrl: 'https://test.arpae.it/get-time-series/',
+      fallbackSerieGraficoBaseUrl: null,
+      usaSerieGrafico: true,
+      fetchFn: fetchMock,
+      nowFn: () => tUltimo,
+    });
+
+    const esito = await servizio.scaricaConStorico(tUltimo);
+    expect(esito.corrente.time).toBe(tUltimo);
+    expect(esito.corrente.stazioni[0].value).toBe(1.25);
+    expect(esito.precedente15Min?.stazioni[0].value).toBeCloseTo(1.2, 4);
+    expect(esito.precedenteUnOra?.stazioni[0].value).toBeCloseTo(1.1, 4);
   });
 });
 

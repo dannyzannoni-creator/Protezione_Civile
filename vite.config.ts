@@ -31,6 +31,12 @@ export default defineConfig({
         rewrite: (path) =>
           path.replace(/^\/api\/sensori/, '/o/api/allerta/get-sensor-values-no-time'),
       },
+      '/api/serie-stazione': {
+        target: 'https://allertameteo.regione.emilia-romagna.it',
+        changeOrigin: true,
+        rewrite: (path) =>
+          path.replace(/^\/api\/serie-stazione/, '/o/api/allerta/get-time-series/'),
+      },
     },
   },
   preview: {
@@ -39,7 +45,14 @@ export default defineConfig({
         target: 'https://allertameteo.regione.emilia-romagna.it',
         changeOrigin: true,
         rewrite: (path) =>
-          path.replace(/^\/api\/sensori/, '/o/api/allerta/get-sensor-values-no-time'),
+          path.replace(/^\/api\/serie-stazione/, '/o/api/allerta/get-time-series/')
+            .replace(/^\/api\/sensori/, '/o/api/allerta/get-sensor-values-no-time'),
+      },
+      '/api/serie-stazione': {
+        target: 'https://allertameteo.regione.emilia-romagna.it',
+        changeOrigin: true,
+        rewrite: (path) =>
+          path.replace(/^\/api\/serie-stazione/, '/o/api/allerta/get-time-series/'),
       },
     },
   },
